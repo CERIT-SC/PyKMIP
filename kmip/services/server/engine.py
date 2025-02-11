@@ -13,6 +13,13 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+from kubernetes import client, config
+from kubernetes.client.exceptions import ApiException
+import base64
+import json
+import os
+import uuid
+
 import copy
 import logging
 import six
@@ -102,6 +109,24 @@ class KmipEngine(object):
             bind=self._data_store
         )
 
+        try:
+            config.load_incluster_config()  # In-cluster config
+        except:
+            config.load_kube_config()  # Local development
+        
+        self.k8s_client = client.CoreV1Api()
+
+        namespace = os.getenv("NAMESPACE")
+
+        if namespace is None:
+           ns_file_path = "/run/secrets/kubernetes.io/serviceaccount/namespace"
+           if not os.path.exists(ns_file_path):
+             raise Exception(f"Namespace file not found at {ns_file_path}")
+           with open(ns_file_path, 'r') as f:
+             namespace = f.read().strip()
+
+        self.namespace = namespace
+
         self._lock = threading.RLock()
 
         self._id_placeholder = None
@@ -132,6 +157,45 @@ class KmipEngine(object):
         self._attribute_policy = policy.AttributePolicy(self._protocol_version)
         self._operation_policies = policies
         self._client_identity = [None, None]
+
+    def _get_secret(self, uid):
+        try:
+           u = uid.lower()
+           secret = self.k8s_client.read_namespaced_secret(f"kmip-key-{u}", self.namespace)
+           return secret
+        except ApiException as e:
+            if e.status == 404:
+               self._logger.info(f"Secret {uid} not found")
+               raise exceptions.ItemNotFound(f"Secret {uid} not found")
+            else:
+               raise
+
+    def _create_secret(self, uid, data):
+       secret = client.V1Secret(
+           metadata=client.V1ObjectMeta(name=f"kmip-key-{uid}"),
+           data={k: base64.b64encode(json.dumps(v).encode()).decode() for k, v in data.items()}
+       )
+       try:
+          self.k8s_client.create_namespaced_secret(self.namespace, secret)
+       except ApiException as e:
+          raise exceptions.KmipError(f"Failed to create Secret: {e}")
+
+    def _update_secret(self, uid, data):
+       secret = self._get_secret(uid)
+       secret.data = {k: base64.b64encode(json.dumps(v).encode()).decode() for k, v in data.items()}
+       try:
+          self.k8s_client.replace_namespaced_secret(f"kmip-key-{uid}", self.namespace, secret)
+       except ApiException as e:
+          raise exceptions.KmipError(f"Failed to update Secret: {e}")
+
+    def _delete_secret(self, uid):
+       try:
+          self.k8s_client.delete_namespaced_secret(f"kmip-key-{uid}", self.namespace)
+       except ApiException as e:
+          if e.status == 404:
+              raise exceptions.ItemNotFound(f"Secret {uid} not found")
+          else:
+              raise
 
     def _get_enum_string(self, e):
         return ''.join([x.capitalize() for x in e.name.split('_')])
@@ -432,43 +496,6 @@ class KmipEngine(object):
                         break
 
         return response_batch
-
-    def _get_object_type(self, unique_identifier):
-        try:
-            object_type = self._data_session.query(
-                objects.ManagedObject._object_type
-            ).filter(
-                objects.ManagedObject.unique_identifier == unique_identifier
-            ).one()[0]
-        except exc.NoResultFound:
-            self._logger.warning(
-                "Could not identify object type for object: {0}".format(
-                    unique_identifier
-                )
-            )
-            raise exceptions.ItemNotFound(
-                "Could not locate object: {0}".format(unique_identifier)
-            )
-        except exc.MultipleResultsFound as e:
-            self._logger.warning(
-                "Multiple objects found for ID: {0}".format(
-                    unique_identifier
-                )
-            )
-            raise e
-
-        class_type = self._object_map.get(object_type)
-        if class_type is None:
-            name = object_type.name
-            raise exceptions.InvalidField(
-                "The {0} object type is not supported.".format(
-                    ''.join(
-                        [x.capitalize() for x in name.split('_')]
-                    )
-                )
-            )
-
-        return class_type
 
     def _build_core_object(self, obj):
         try:
@@ -1231,14 +1258,24 @@ class KmipEngine(object):
             uid,
             operation
     ):
-        object_type = self._get_object_type(uid)
+        secret = self._get_secret(uid)
+        secret_data = {}
+        for key in secret.data:
+            data = base64.b64decode(secret.data[key]).decode("utf-8")
+            if data[0] == '"':
+                data = data.replace('"', '')
+            secret_data[key] = data
 
-        managed_object = self._data_session.query(object_type).filter(
-            object_type.unique_identifier == uid
-        ).one()
-
-        # TODO (peter-hamilton) Add debug log with policy contents?
-
+        managed_object = objects.SymmetricKey(
+           algorithm=enums.CryptographicAlgorithm[secret_data["algorithm"]],
+           length=int(secret_data["length"]),
+           value=base64.b64decode(secret_data["value"]),
+        )
+        managed_object._owner = secret_data["owner"]
+        managed_object.initial_date = int(secret_data["initial_date"])
+        managed_object.operation_policy_name = secret_data["policy"]
+        managed_object.unique_identifier = uid
+ 
         # Determine if the request should be carried out under the object's
         # operation policy. If not, feign ignorance of the object.
         is_allowed = self._is_allowed_by_operation_policy(
@@ -1255,16 +1292,48 @@ class KmipEngine(object):
 
         return managed_object
 
-    def _list_objects_with_access_controls(
-            self,
-            operation
-    ):
-        managed_objects = None
-        managed_objects_allowed = list()
+    def _list_objects_with_access_controls(self, operation):
+       managed_objects_allowed = []
 
-        managed_objects = self._data_session.query(objects.ManagedObject).all()
+       try:
+          # Get all secrets in the namespace
+          secrets = self.k8s_client.list_namespaced_secret(self.namespace).items
+       except ApiException as e:
+          self._logger.error(f"Failed to list secrets: {e}")
+          return managed_objects_allowed
 
-        for managed_object in managed_objects:
+       for secret in secrets:
+          if not secret.metadata.name.startswith("kmip-key"):
+            continue
+          try:
+            # Decode secret data
+            secret_data = {k: json.loads(base64.b64decode(v).decode()) 
+                         for k, v in secret.data.items()}
+
+            # Reconstruct managed object from secret
+            object_type = enums.ObjectType[secret_data.get('object_type')]
+            cls = self._object_map.get(object_type)
+            
+            if not cls:
+                continue
+
+            managed_object = cls(
+                cryptographic_algorithm=enums.CryptographicAlgorithm[secret_data['algorithm']],
+                cryptographic_length=secret_data['length'],
+                value=base64.b64decode(secret_data['value']),
+                names=secret_data.get('names', []),
+                cryptographic_usage_masks=[
+                    enums.CryptographicUsageMask[m] 
+                    for m in secret_data.get('usage_masks', [])
+                ],
+                operation_policy_name=secret_data.get('operation_policy'),
+                state=enums.State[secret_data.get('state', 'PRE_ACTIVE')],
+                _owner=secret_data.get('owner'),
+                initial_date=secret_data.get('initial_date')
+            )
+            managed_object.unique_identifier = secret.metadata.name
+
+            # Check access controls
             is_allowed = self._is_allowed_by_operation_policy(
                 managed_object.operation_policy_name,
                 self._client_identity,
@@ -1272,10 +1341,15 @@ class KmipEngine(object):
                 managed_object.object_type,
                 operation
             )
-            if is_allowed is True:
+            
+            if is_allowed:
                 managed_objects_allowed.append(managed_object)
 
-        return managed_objects_allowed
+          except (KeyError, ValueError, TypeError) as e:
+            self._logger.warning(f"Skipping invalid secret {secret.metadata.name}: {e}")
+            continue
+
+       return managed_objects_allowed
 
     def _process_operation(self, operation, payload):
         # TODO (peterhamilton) Alphabetize this.
@@ -1398,11 +1472,23 @@ class KmipEngine(object):
         managed_object._owner = self._client_identity[0]
         managed_object.initial_date = int(time.time())
 
-        self._data_session.add(managed_object)
+        if managed_object.operation_policy_name is None:
+            managed_object.operation_policy_name = 'default'
 
-        # NOTE (peterhamilton) SQLAlchemy will *not* assign an ID until
-        # commit is called. This makes future support for UNDO problematic.
-        self._data_session.commit()
+        # Serialize object data
+        secret_data = {
+           "object_type": str(managed_object._object_type),
+           "algorithm": managed_object.cryptographic_algorithm.name,
+           "length": managed_object.cryptographic_length,
+           "value": base64.b64encode(managed_object.value).decode(),
+           "owner": managed_object._owner,
+           "initial_date": str(managed_object.initial_date),
+           "policy": managed_object.operation_policy_name
+        }
+
+        managed_object.unique_identifier = uuid.uuid4()
+
+        self._create_secret(str(managed_object.unique_identifier), secret_data)
 
         self._logger.info(
             "Created a SymmetricKey with ID: {0}".format(

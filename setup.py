@@ -55,7 +55,8 @@ setuptools.setup(
         "enum-compat",
         "requests",
         "six",
-        "sqlalchemy"
+        "sqlalchemy",
+        "kubernetes"
     ],
     python_requires=">= 3.8",
     classifiers=[
